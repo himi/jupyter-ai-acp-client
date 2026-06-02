@@ -119,16 +119,252 @@ class BaseAcpPersona(BasePersona):
         # Wait until user is authenticated
         await self._before_subprocess_future
         self.log.info("Spawning ACP agent subprocess for '%s'.", self.__class__.__name__)
-        kwargs: dict[str, Any] = dict(
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=sys.stderr,
-            limit=50 * 1024 * 1024,
-            start_new_session=True,
-        )
-        if env is not None:
-            kwargs["env"] = env
-        process = await asyncio.create_subprocess_exec(*self._executable, **kwargs)
+
+        if sys.platform != "win32":
+            # Unix/macOS: use asyncio.create_subprocess_exec() directly.
+            # ProactorEventLoop (or any loop supporting subprocess pipes) is available.
+            kwargs: dict[str, Any] = dict(
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=sys.stderr,
+                limit=50 * 1024 * 1024,
+                start_new_session=True,
+            )
+            if env is not None:
+                kwargs["env"] = env
+            process = await asyncio.create_subprocess_exec(*self._executable, **kwargs)
+
+        else:
+            # Windows workaround:
+            #
+            # jupyter_server intentionally switches the event loop policy to
+            # WindowsSelectorEventLoopPolicy for Tornado compatibility
+            # (see jupyter_server/utils.py: maybe_patch_ioloop()).
+            # SelectorEventLoop does NOT support asyncio.create_subprocess_exec()
+            # with PIPE on Windows -- it raises NotImplementedError because Windows
+            # cannot select() on pipes (only on sockets).
+            #
+            # ProactorEventLoop (IOCP-based) supports pipe subprocesses, but is
+            # incompatible with Tornado 6.x which Jupyter depends on.
+            #
+            # Workaround: use subprocess.Popen (blocking) and bridge stdio via:
+            #   - A daemon thread that calls readline() on stdout (blocking I/O)
+            #     and feeds data into an asyncio.Queue via call_soon_threadsafe().
+            #   - FakeStreamReader/FakeStreamWriter subclasses that pass
+            #     isinstance(x, asyncio.StreamReader/StreamWriter) checks required
+            #     by acp.client.connection.ClientSideConnection, while internally
+            #     using the Queue-based bridge instead of the real transport.
+            #
+            # NOTE: read(n) does NOT work here -- Windows pipe buffering causes it
+            # to block until the buffer is full. readline() is required because
+            # ACP uses newline-delimited JSON (JSON-Lines), so each response is
+            # exactly one line.
+            #
+            # TODO: If goose/other ACP agents ever support a --port TCP listen
+            # mode, replace this with asyncio.open_connection() which works
+            # natively on SelectorEventLoop.
+
+            import subprocess
+            import threading
+
+            popen_kwargs: dict[str, Any] = dict(
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                start_new_session=True,
+            )
+            if env is not None:
+                popen_kwargs["env"] = env
+
+            popen = subprocess.Popen(list(self._executable), **popen_kwargs)
+            loop = asyncio.get_event_loop()
+
+            class _FakeStreamReader(asyncio.StreamReader):
+                """
+                Subclass of asyncio.StreamReader that passes isinstance() checks
+                but uses an asyncio.Queue fed by a background thread instead of
+                the real asyncio transport (which requires ProactorEventLoop on
+                Windows).
+                """
+                def __init__(self, limit: int = 2 ** 16):
+                    # Do NOT call super().__init__() -- it would attempt to bind to
+                    # the current event loop transport, which fails on
+                    # SelectorEventLoop with pipe handles.
+                    self._queue: asyncio.Queue = None  # lazy-initialized
+                    self._buf = b""
+                    self._eof = False
+
+                def _get_queue(self) -> asyncio.Queue:
+                    # Lazy initialization ensures the Queue is created on the
+                    # running event loop, not at construction time.
+                    if self._queue is None:
+                        self._queue = asyncio.Queue()
+                    return self._queue
+
+                def feed_data_threadsafe(
+                    self, loop: asyncio.AbstractEventLoop, data: bytes
+                ) -> None:
+                    loop.call_soon_threadsafe(self._get_queue().put_nowait, data)
+
+                def feed_eof_threadsafe(
+                    self, loop: asyncio.AbstractEventLoop
+                ) -> None:
+                    loop.call_soon_threadsafe(self._get_queue().put_nowait, None)
+
+                async def readline(self) -> bytes:
+                    while b"\n" not in self._buf and not self._eof:
+                        item = await self._get_queue().get()
+                        if item is None:
+                            self._eof = True
+                            break
+                        self._buf += item
+                    if b"\n" in self._buf:
+                        idx = self._buf.index(b"\n")
+                        line, self._buf = self._buf[: idx + 1], self._buf[idx + 1 :]
+                    else:
+                        line, self._buf = self._buf, b""
+                    return line
+
+                async def readuntil(self, separator: bytes = b"\n") -> bytes:
+                    while separator not in self._buf and not self._eof:
+                        item = await self._get_queue().get()
+                        if item is None:
+                            self._eof = True
+                            break
+                        self._buf += item
+                    if separator in self._buf:
+                        idx = self._buf.index(separator) + len(separator)
+                        line, self._buf = self._buf[:idx], self._buf[idx:]
+                    else:
+                        line, self._buf = self._buf, b""
+                    return line
+
+                async def readexactly(self, n: int) -> bytes:
+                    while len(self._buf) < n and not self._eof:
+                        item = await self._get_queue().get()
+                        if item is None:
+                            raise asyncio.IncompleteReadError(self._buf, n)
+                        self._buf += item
+                    data, self._buf = self._buf[:n], self._buf[n:]
+                    return data
+
+                async def read(self, n: int = -1) -> bytes:
+                    if not self._buf and not self._eof:
+                        item = await self._get_queue().get()
+                        if item is None:
+                            self._eof = True
+                        else:
+                            self._buf += item
+                    if n == -1:
+                        data, self._buf = self._buf, b""
+                    else:
+                        data, self._buf = self._buf[:n], self._buf[n:]
+                    return data
+
+                def at_eof(self) -> bool:
+                    return self._eof and not self._buf
+
+            class _FakeStreamWriter(asyncio.StreamWriter):
+                """
+                Subclass of asyncio.StreamWriter that passes isinstance() checks
+                but writes synchronously to the Popen stdin pipe instead of using
+                the real asyncio transport.
+
+                write() flushes immediately because the ACP sender calls drain()
+                after write(), and a buffered-but-unflushed write would cause
+                Goose to wait indefinitely for a complete JSON-Lines message.
+                """
+                def __init__(self, popen_stdin, loop: asyncio.AbstractEventLoop):
+                    # Do NOT call super().__init__() -- requires a real transport.
+                    self._popen_stdin = popen_stdin
+                    self._loop = loop
+
+                def write(self, data: bytes) -> None:
+                    self._popen_stdin.write(data)
+                    self._popen_stdin.flush()
+
+                def writelines(self, data) -> None:
+                    for chunk in data:
+                        self.write(chunk)
+
+                async def drain(self) -> None:
+                    pass  # Already flushed synchronously in write()
+
+                def close(self) -> None:
+                    try:
+                        self._popen_stdin.close()
+                    except Exception:
+                        pass
+
+                async def wait_closed(self) -> None:
+                    pass
+
+                def is_closing(self) -> bool:
+                    return False
+
+                def get_extra_info(self, name: str, default=None):
+                    return default
+
+            stdout_reader = _FakeStreamReader(limit=50 * 1024 * 1024)
+            stdin_writer = _FakeStreamWriter(popen.stdin, loop)
+
+            def _stdout_bridge() -> None:
+                # Runs in a daemon thread. Calls readline() (blocking) on the
+                # Popen stdout pipe and forwards each line to the async reader.
+                #
+                # IMPORTANT: read(n) must NOT be used here. On Windows, pipe reads
+                # block until n bytes are available in the buffer regardless of
+                # whether a complete message has arrived. Since ACP messages are
+                # newline-terminated, readline() is both correct and necessary.
+                try:
+                    while True:
+                        line = popen.stdout.readline()
+                        if not line:
+                            stdout_reader.feed_eof_threadsafe(loop)
+                            break
+                        stdout_reader.feed_data_threadsafe(loop, line)
+                except Exception:
+                    stdout_reader.feed_eof_threadsafe(loop)
+
+            threading.Thread(target=_stdout_bridge, daemon=True).start()
+
+            class _PortableProcess:
+                """
+                Duck-typed replacement for asyncio.subprocess.Process.
+                Wraps a subprocess.Popen instance with FakeStreamReader/Writer
+                so that the rest of the ACP client stack is unaware of the
+                Windows workaround.
+                """
+                def __init__(self):
+                    # Note: ClientSideConnection(client, input_stream, output_stream)
+                    # expects input_stream=StreamWriter (stdin) and
+                    # output_stream=StreamReader (stdout) from the agent's perspective.
+                    self.stdin = stdin_writer
+                    self.stdout = stdout_reader
+                    self.pid = popen.pid
+                    self._popen = popen
+
+                @property
+                def returncode(self):
+                    return popen.returncode
+
+                async def wait(self):
+                    return await loop.run_in_executor(None, popen.wait)
+
+                def terminate(self):
+                    try:
+                        popen.terminate()
+                    except Exception:
+                        pass
+
+                def kill(self):
+                    try:
+                        popen.kill()
+                    except Exception:
+                        pass
+
+            process = _PortableProcess()
+
         self.log.info("Spawned ACP agent subprocess for '%s'.", self.__class__.__name__)
         return process
 
