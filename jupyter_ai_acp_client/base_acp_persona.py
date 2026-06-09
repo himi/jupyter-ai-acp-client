@@ -326,6 +326,24 @@ class BaseAcpPersona(BasePersona):
             stdout_reader = _FakeStreamReader(limit=50 * 1024 * 1024)
             stdin_writer = _FakeStreamWriter(popen.stdin, loop)
 
+            stop_event = threading.Event()
+
+            def _do_terminate():
+                """Ensure Goose subprocess and bridge thread are cleaned up."""
+                stop_event.set()
+                try:
+                    popen.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if popen.returncode is None:
+                        popen.kill()
+                except Exception:
+                    pass
+
+            import atexit
+            atexit.register(_do_terminate)
+
             def _stdout_bridge() -> None:
                 # Runs in a daemon thread. Calls readline() (blocking) on the
                 # Popen stdout pipe and forwards each line to the async reader.
@@ -335,7 +353,7 @@ class BaseAcpPersona(BasePersona):
                 # whether a complete message has arrived. Since ACP messages are
                 # newline-terminated, readline() is both correct and necessary.
                 try:
-                    while True:
+                    while not stop_event.is_set():
                         line = popen.stdout.readline()
                         if not line:
                             stdout_reader.feed_eof_threadsafe(loop)
@@ -370,16 +388,10 @@ class BaseAcpPersona(BasePersona):
                     return await loop.run_in_executor(None, popen.wait)
 
                 def terminate(self):
-                    try:
-                        popen.terminate()
-                    except Exception:
-                        pass
+                    _do_terminate()
 
                 def kill(self):
-                    try:
-                        popen.kill()
-                    except Exception:
-                        pass
+                    _do_terminate()
 
             process = _PortableProcess()
 
@@ -773,6 +785,7 @@ class BaseAcpPersona(BasePersona):
                 self.__class__.__name__,
                 exc_info=True,
             )
+
 
         # Step 3: Stop the subprocess and its process tree.
         # Use psutil for cross-platform process tree termination instead of
