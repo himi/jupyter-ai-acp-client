@@ -774,31 +774,45 @@ class BaseAcpPersona(BasePersona):
                 exc_info=True,
             )
 
-        # Step 3: Stop the subprocess gracefully, falling back to SIGKILL
+        # Step 3: Stop the subprocess and its process tree.
+        # Use psutil for cross-platform process tree termination instead of
+        # os.getpgid()/os.killpg() which are Unix-only and fail on Windows.
+        # psutil is already a transitive dependency via jupyter_client and
+        # ipykernel, so this introduces no new packages in practice.
         try:
+            import contextlib
+            import psutil
             subprocess = await self.get_agent_subprocess()
-            pgid = os.getpgid(subprocess.pid)
-            os.killpg(pgid, signal.SIGINT)
-            os.killpg(pgid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(subprocess.wait(), timeout=5.0)
+                parent = psutil.Process(subprocess.pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        child.terminate()
+                parent.terminate()
+                try:
+                    await asyncio.wait_for(subprocess.wait(), timeout=5.0)
+                    self.log.info(
+                        "[shutdown] Step 3: subprocess terminated for '%s'.",
+                        self.__class__.__name__,
+                    )
+                except asyncio.TimeoutError:
+                    for child in children:
+                        with contextlib.suppress(psutil.NoSuchProcess):
+                            child.kill()
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        parent.kill()
+                    self.log.info(
+                        "[shutdown] Step 3: subprocess killed after timeout for '%s'.",
+                        self.__class__.__name__,
+                    )
+            except psutil.NoSuchProcess:
                 self.log.info(
-                    "[shutdown] Step 3: subprocess terminated for '%s'.",
-                    self.__class__.__name__,
-                )
-            except asyncio.TimeoutError:
-                os.killpg(pgid, signal.SIGKILL)
-                self.log.info(
-                    "[shutdown] Step 3: subprocess killed after timeout for '%s'.",
+                    "[shutdown] Step 3: subprocess already dead for '%s'.",
                     self.__class__.__name__,
                 )
         except asyncio.CancelledError:
             pass
-        except (ProcessLookupError, PermissionError, OSError):
-            self.log.info(
-                "[shutdown] Step 3: subprocess already dead for '%s'.",
-                self.__class__.__name__,
-            )
         except Exception:
             self.log.warning(
                 "[shutdown] Step 3: failed for '%s'.",
