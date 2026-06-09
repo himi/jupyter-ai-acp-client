@@ -274,10 +274,28 @@ class BaseAcpPersona(BasePersona):
                 after write(), and a buffered-but-unflushed write would cause
                 Goose to wait indefinitely for a complete JSON-Lines message.
                 """
+
+                class _DummyTransport:
+                    """
+                    Minimal transport stub to satisfy asyncio.StreamWriter.__del__,
+                    which references self._transport without calling any methods on it.
+                    Any method that may be called during cleanup is implemented as a no-op.
+                    """
+                    def is_closing(self) -> bool:
+                        return True
+
+                    def close(self) -> None:
+                        pass
+
+                    def get_extra_info(self, name: str, default=None):
+                        return default
+
                 def __init__(self, popen_stdin, loop: asyncio.AbstractEventLoop):
                     # Do NOT call super().__init__() -- requires a real transport.
                     self._popen_stdin = popen_stdin
                     self._loop = loop
+                    # Satisfy asyncio.StreamWriter.__del__ which accesses self._transport
+                    self._transport = self._DummyTransport()
 
                 def write(self, data: bytes) -> None:
                     self._popen_stdin.write(data)
