@@ -5,6 +5,9 @@ import logging
 import os
 import shlex
 import signal as signal_module
+import subprocess
+import sys
+import threading
 import uuid
 from asyncio.subprocess import Process
 from dataclasses import dataclass, field
@@ -63,11 +66,181 @@ def _log_output_task_exception(task: asyncio.Task) -> None:
         log.error("Terminal output reader failed", exc_info=exc)
 
 
+class _WindowsProcess:
+    """
+    Duck-typed replacement for asyncio.subprocess.Process on Windows.
+
+    On Windows, jupyter_server switches the event loop to
+    WindowsSelectorEventLoopPolicy for Tornado compatibility. SelectorEventLoop
+    does not support asyncio.create_subprocess_exec() with PIPE, raising
+    NotImplementedError. This class wraps subprocess.Popen and bridges stdout
+    to an asyncio.StreamReader-like queue so that the rest of TerminalManager
+    is unaware of the workaround.
+
+    stdout is read in a daemon thread using read() rather than readline()
+    because terminal output is not newline-delimited — unlike ACP JSON-Lines
+    messages, shell commands may produce arbitrary binary output.
+    The daemon thread feeds chunks into an asyncio.Queue which is drained
+    by the async read() method below.
+    """
+
+    def __init__(
+        self,
+        popen: subprocess.Popen,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._popen = popen
+        self._loop = loop
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._eof = False
+        self.pid = popen.pid
+
+        # Drain stdout in a background daemon thread.
+        # Using read(4096) here is intentional: terminal output is not
+        # line-delimited, so readline() would block on commands that do not
+        # emit a trailing newline (e.g. interactive prompts). read() returns
+        # as soon as any data is available, which is the correct behaviour
+        # for streaming terminal output.
+        def _stdout_reader() -> None:
+            try:
+                while True:
+                    chunk = popen.stdout.read(4096)
+                    if not chunk:
+                        loop.call_soon_threadsafe(self._queue.put_nowait, b"")
+                        break
+                    loop.call_soon_threadsafe(self._queue.put_nowait, chunk)
+            except Exception:
+                loop.call_soon_threadsafe(self._queue.put_nowait, b"")
+
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+
+        # Expose a stdout object with an async read() method so that
+        # _read_terminal_output() can call info.process.stdout.read(4096)
+        # without modification.
+        self.stdout = self
+
+    async def read(self, n: int = 4096) -> bytes:
+        """Async read — drains the queue fed by the background thread."""
+        if self._eof:
+            return b""
+        chunk = await self._queue.get()
+        if not chunk:
+            self._eof = True
+        return chunk
+
+    @property
+    def returncode(self) -> int | None:
+        return self._popen.returncode
+
+    async def wait(self) -> int:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._popen.wait)
+
+    def terminate(self) -> None:
+        self._kill_tree()
+
+    def kill(self) -> None:
+        self._kill_tree()
+
+    def _kill_tree(self) -> None:
+        """Kill the process tree using psutil for cross-platform support."""
+        try:
+            import psutil
+            parent = psutil.Process(self._popen.pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            try:
+                parent.kill()
+            except psutil.NoSuchProcess:
+                pass
+        except Exception:
+            try:
+                self._popen.kill()
+            except Exception:
+                pass
+
+
+async def _create_terminal_process(
+    cmd_args: list[str],
+    cwd: str | None,
+    env_dict: dict | None,
+) -> "Process | _WindowsProcess":
+    """
+    Create a subprocess for terminal execution.
+
+    On non-Windows platforms, uses asyncio.create_subprocess_exec() directly.
+    On Windows, falls back to subprocess.Popen with a background thread bridge
+    because SelectorEventLoop (used by jupyter_server for Tornado compatibility)
+    does not support asyncio.create_subprocess_exec() with PIPE.
+    """
+    if sys.platform != "win32":
+        return await asyncio.create_subprocess_exec(
+            *cmd_args,
+            cwd=cwd,
+            env=env_dict,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    # Windows: use subprocess.Popen + background thread bridge.
+    # CREATE_NEW_PROCESS_GROUP isolates the child from Ctrl+C signals
+    # sent to the Jupyter process, equivalent to start_new_session=True
+    # on Unix.
+    popen = subprocess.Popen(
+        cmd_args,
+        cwd=cwd,
+        env=env_dict,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    loop = asyncio.get_event_loop()
+    return _WindowsProcess(popen, loop)
+
+
+def _kill_process_tree(process: "Process | _WindowsProcess") -> None:
+    """
+    Kill a process and its entire process tree.
+
+    Uses psutil for cross-platform support instead of os.killpg()/os.getpgid()
+    which are Unix-only and raise AttributeError on Windows.
+    psutil is already a transitive dependency via jupyter_client and ipykernel,
+    so this introduces no new packages in practice.
+    """
+    if isinstance(process, _WindowsProcess):
+        process._kill_tree()
+        return
+
+    try:
+        import psutil
+        parent = psutil.Process(process.pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        try:
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
 @dataclass
 class TerminalInfo:
     """Tracks state for a single terminal instance."""
 
-    process: Process
+    process: "Process | _WindowsProcess"
     session_id: str
     output_buffer: bytearray = field(default_factory=bytearray)
     output_byte_limit: int | None = None
@@ -225,10 +398,7 @@ class TerminalManager:
     ) -> CreateTerminalResponse:
         """
         Create a new terminal and start executing a command.
-
-        Returns immediately with a terminal_id; the command runs in the background.
         """
-        # Enforce terminal count limit
         if len(self._terminals) >= MAX_TERMINALS:
             raise RequestError.invalid_request(
                 {
@@ -293,15 +463,7 @@ class TerminalManager:
             raise RequestError.invalid_params({"command": "command cannot be empty"})
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                cwd=cwd,
-                env=env_dict,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout
-                start_new_session=True,  # New process group for clean kill
-            )
+            process = await _create_terminal_process(cmd_args, cwd, env_dict)
         except FileNotFoundError:
             raise RequestError.invalid_params(
                 {"command": f"command not found: {command}"}
@@ -393,13 +555,7 @@ class TerminalManager:
         info = self._validate_terminal(terminal_id, session_id)
 
         if info.process.returncode is None:
-            # Kill the entire process group so child processes are cleaned up.
-            try:
-                os.killpg(os.getpgid(info.process.pid), signal_module.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                # Process already exited or is inaccessible — fall back to
-                # direct kill which is a no-op if already dead.
-                info.process.kill()
+            _kill_process_tree(info.process)
             exit_code = await info.process.wait()
             self._set_exit_status(info, exit_code)
 
@@ -417,10 +573,7 @@ class TerminalManager:
 
         # Kill process if still running
         if info.process.returncode is None:
-            try:
-                os.killpg(os.getpgid(info.process.pid), signal_module.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                info.process.kill()
+            _kill_process_tree(info.process)
             await info.process.wait()
 
         # Cancel the output reading task if it's still running
