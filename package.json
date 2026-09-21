@@ -1,6 +1,6 @@
 {
     "name": "@jupyter-ai/acp-client",
-    "version": "0.1.5",
+    "version": "0.3.0",
     "description": "The ACP client for Jupyter AI, allowing for ACP agents to be used in JupyterLab",
     "keywords": [
         "jupyter",
@@ -56,7 +56,8 @@
         "watch:labextension": "jupyter labextension watch ."
     },
     "dependencies": {
-        "@jupyter/chat": "0.20.0-alpha.2",
+        "@jupyter/chat": "^0.23.0-alpha.4",
+        "@jupyter/ydoc": "*",
         "@jupyterlab/application": "^4.0.0",
         "@jupyterlab/coreutils": "^6.0.0",
         "@jupyterlab/services": "^7.0.0",
@@ -116,9 +117,6 @@
         },
         "extension": true,
         "outputDir": "jupyter_ai_acp_client/labextension",
-        "disabledExtensions": [
-            "jupyterlab-chat-extension:inputToolbarFactory"
-        ],
         "sharedPackages": {
             "@jupyter/chat": {
                 "bundled": false,

@@ -14,10 +14,10 @@ def make_persona(message_id_seq: list[str] | str | None = None) -> MagicMock:
     if message_id_seq is None:
         message_id_seq = ["msg-1"]
     if isinstance(message_id_seq, str):
-        persona.ychat.add_message.return_value = message_id_seq
+        persona.chat.add_message.return_value = message_id_seq
     else:
-        persona.ychat.add_message.side_effect = list(message_id_seq)
-    persona.ychat.get_message.return_value = MagicMock()
+        persona.chat.add_message.side_effect = list(message_id_seq)
+    persona.chat.get_message.return_value = MagicMock()
     return persona
 
 
@@ -154,7 +154,7 @@ class TestGetOrCreateTextMessage:
         msg_id = mgr.get_or_create_text_message(SESSION_ID, persona)
 
         assert msg_id == "msg-1"
-        persona.ychat.add_message.assert_called_once()
+        persona.chat.add_message.assert_called_once()
 
     def test_returns_existing_on_consecutive_calls(self):
         mgr = ToolCallManager()
@@ -165,7 +165,7 @@ class TestGetOrCreateTextMessage:
         second = mgr.get_or_create_text_message(SESSION_ID, persona)
 
         assert first == second == "msg-1"
-        persona.ychat.add_message.assert_called_once()
+        persona.chat.add_message.assert_called_once()
 
     def test_creates_new_after_tool_call(self):
         """After a tool call, the next text chunk creates a new message."""
@@ -177,16 +177,16 @@ class TestGetOrCreateTextMessage:
 
         msg_id = mgr.get_or_create_text_message(SESSION_ID, persona)
         assert msg_id == "msg-text"
-        assert persona.ychat.add_message.call_count == 2
+        assert persona.chat.add_message.call_count == 2
 
-    def test_sets_awareness_on_creation(self):
+    def test_sets_status_on_creation(self):
         mgr = ToolCallManager()
         persona = make_persona("msg-1")
         mgr.reset(SESSION_ID)
 
         mgr.get_or_create_text_message(SESSION_ID, persona)
 
-        persona.awareness.set_local_state_field.assert_called_with("isWriting", "msg-1")
+        persona.set_status.assert_called_with()
 
     def test_does_not_flush_tool_calls_on_creation(self):
         """get_or_create_text_message must not write tool call metadata."""
@@ -196,7 +196,7 @@ class TestGetOrCreateTextMessage:
 
         mgr.get_or_create_text_message(SESSION_ID, persona)
 
-        persona.ychat.update_message.assert_not_called()
+        persona.chat.update_message.assert_not_called()
 
 
 class TestHandleStart:
@@ -219,13 +219,13 @@ class TestHandleStart:
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
 
-        assert persona.ychat.add_message.call_count == 1
+        assert persona.chat.add_message.call_count == 1
         session = mgr._sessions[SESSION_ID]
         assert session.tool_call_message_ids["tc-1"] == "msg-1"
         assert session.tool_call_message_ids["tc-2"] == "msg-1"
 
         # Verify grouped metadata contains both tool calls in order
-        flushed_msg = persona.ychat.update_message.call_args[0][0]
+        flushed_msg = persona.chat.update_message.call_args[0][0]
         tc_ids = [tc["tool_call_id"] for tc in flushed_msg.metadata["tool_calls"]]
         assert tc_ids == ["tc-1", "tc-2"]
 
@@ -236,9 +236,9 @@ class TestHandleStart:
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
 
-        persona.ychat.update_message.assert_called_once()
+        persona.chat.update_message.assert_called_once()
         # Verify the metadata contains only this tool call
-        flushed_msg = persona.ychat.update_message.call_args[0][0]
+        flushed_msg = persona.chat.update_message.call_args[0][0]
         assert len(flushed_msg.metadata["tool_calls"]) == 1
         assert flushed_msg.metadata["tool_calls"][0]["tool_call_id"] == "tc-1"
 
@@ -317,11 +317,11 @@ class TestHandleStart:
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1", "read", "read"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1", "Reading file.py", "read"), persona)
 
-        persona.ychat.add_message.assert_called_once()  # only 1 message created
+        persona.chat.add_message.assert_called_once()  # only 1 message created
         assert mgr._sessions[SESSION_ID].tool_call_message_ids["tc-1"] == "msg-1"
         assert mgr._sessions[SESSION_ID].tool_calls["tc-1"].title == "Reading file.py"
         # Flush called twice (once per start), both targeting the same message
-        assert persona.ychat.update_message.call_count == 2
+        assert persona.chat.update_message.call_count == 2
 
     def test_repeated_start_after_text_does_not_create_new_message(self):
         """Repeated start for an already-assigned tool call reuses its message."""
@@ -334,7 +334,7 @@ class TestHandleStart:
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1", "Reading file.py"), persona)
         # No new message created — tc-1 already had msg-tc
-        assert persona.ychat.add_message.call_count == 2  # msg-tc + msg-text only
+        assert persona.chat.add_message.call_count == 2  # msg-tc + msg-text only
 
 
 class TestHandleProgress:
@@ -363,7 +363,7 @@ class TestHandleProgress:
 
         assert "tc-orphan" in mgr._sessions[SESSION_ID].tool_calls
         assert mgr._sessions[SESSION_ID].tool_call_message_ids["tc-orphan"] == "msg-orphan"
-        persona.ychat.add_message.assert_called_once()
+        persona.chat.add_message.assert_called_once()
 
     def test_flushes_to_grouped_message(self):
         """Progress for a grouped tool call flushes to the shared message."""
@@ -373,14 +373,14 @@ class TestHandleProgress:
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
-        persona.ychat.update_message.reset_mock()
+        persona.chat.update_message.reset_mock()
 
         mgr.handle_progress(
             SESSION_ID, make_tool_call_progress("tc-1", status="completed"), persona
         )
 
         # Both tool calls share msg-1
-        persona.ychat.get_message.assert_called_with("msg-1")
+        persona.chat.get_message.assert_called_with("msg-1")
 
     def test_non_serializable_raw_output_is_stringified(self):
         mgr = ToolCallManager()
@@ -423,7 +423,7 @@ class TestHandleProgress:
         # Next text chunk must create a new message, not reuse the tool call's message
         text_msg = mgr.get_or_create_text_message(SESSION_ID, persona)
         assert text_msg == "msg-text"
-        assert persona.ychat.add_message.call_count == 2
+        assert persona.chat.add_message.call_count == 2
 
     def test_empty_status_treated_as_none(self):
         """Empty string status must not overwrite existing status."""
@@ -473,12 +473,12 @@ class TestFlushToolCall:
         persona = make_persona(["msg-1"])
         mgr.reset(SESSION_ID)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1", "Reading"), persona)
-        persona.ychat.update_message.reset_mock()
+        persona.chat.update_message.reset_mock()
 
         mgr.flush_tool_call(SESSION_ID, "tc-1", persona)
 
-        persona.ychat.update_message.assert_called_once()
-        flushed_msg = persona.ychat.update_message.call_args[0][0]
+        persona.chat.update_message.assert_called_once()
+        flushed_msg = persona.chat.update_message.call_args[0][0]
         assert len(flushed_msg.metadata["tool_calls"]) == 1
         assert flushed_msg.metadata["tool_calls"][0]["tool_call_id"] == "tc-1"
 
@@ -486,25 +486,25 @@ class TestFlushToolCall:
         mgr = ToolCallManager()
         persona = make_persona()
         mgr.flush_tool_call("nonexistent", "tc-1", persona)
-        persona.ychat.get_message.assert_not_called()
+        persona.chat.get_message.assert_not_called()
 
     def test_noop_when_message_id_missing(self):
         mgr = ToolCallManager()
         persona = make_persona()
         mgr.reset(SESSION_ID)
         mgr.flush_tool_call(SESSION_ID, "unknown-tc", persona)
-        persona.ychat.get_message.assert_not_called()
+        persona.chat.get_message.assert_not_called()
 
     def test_noop_when_yjs_message_deleted(self):
         mgr = ToolCallManager()
         persona = make_persona(["msg-1"])
-        persona.ychat.get_message.return_value = None
+        persona.chat.get_message.return_value = None
         mgr.reset(SESSION_ID)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
-        persona.ychat.update_message.reset_mock()
+        persona.chat.update_message.reset_mock()
 
         mgr.flush_tool_call(SESSION_ID, "tc-1", persona)
-        persona.ychat.update_message.assert_not_called()
+        persona.chat.update_message.assert_not_called()
 
 
 class TestStateMachine:
@@ -518,7 +518,7 @@ class TestStateMachine:
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mid3 = mgr.get_or_create_text_message(SESSION_ID, persona)
 
-        assert persona.ychat.add_message.call_count == 3
+        assert persona.chat.add_message.call_count == 3
         assert mid1 == "msg-1"
         assert mgr._sessions[SESSION_ID].tool_call_message_ids["tc-1"] == "msg-2"
         assert mid3 == "msg-3"
@@ -534,7 +534,7 @@ class TestStateMachine:
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
 
-        assert persona.ychat.add_message.call_count == 2
+        assert persona.chat.add_message.call_count == 2
         session = mgr._sessions[SESSION_ID]
         assert session.tool_call_message_ids["tc-1"] == "msg-tc"
         assert session.tool_call_message_ids["tc-2"] == "msg-tc"
@@ -549,7 +549,7 @@ class TestStateMachine:
         mgr.get_or_create_text_message(SESSION_ID, persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
 
-        assert persona.ychat.add_message.call_count == 3
+        assert persona.chat.add_message.call_count == 3
         session = mgr._sessions[SESSION_ID]
         assert session.tool_call_message_ids["tc-1"] == "msg-tc1"
         assert session.tool_call_message_ids["tc-2"] == "msg-tc2"
@@ -562,9 +562,9 @@ class TestStateMachine:
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
 
-        assert persona.ychat.add_message.call_count == 1
+        assert persona.chat.add_message.call_count == 1
         # Verify message was created with empty body
-        add_call = persona.ychat.add_message.call_args
+        add_call = persona.chat.add_message.call_args
         assert add_call[0][0].body == ""
 
     def test_consecutive_text_chunks_reuse_message(self):
@@ -578,7 +578,7 @@ class TestStateMachine:
         mid3 = mgr.get_or_create_text_message(SESSION_ID, persona)
 
         assert mid1 == mid2 == mid3 == "msg-1"
-        persona.ychat.add_message.assert_called_once()
+        persona.chat.add_message.assert_called_once()
 
     def test_progress_targets_grouped_message(self):
         """Progress for any grouped tool call updates the shared message."""
@@ -589,13 +589,13 @@ class TestStateMachine:
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
 
-        persona.ychat.get_message.reset_mock()
+        persona.chat.get_message.reset_mock()
         mgr.handle_progress(
             SESSION_ID, make_tool_call_progress("tc-1", status="completed"), persona
         )
 
         # Both tool calls share the same message
-        persona.ychat.get_message.assert_called_with("msg-1")
+        persona.chat.get_message.assert_called_with("msg-1")
 
     def test_progress_targets_correct_message_across_groups(self):
         """Progress for tc-1 targets its group, not tc-2's group."""
@@ -607,12 +607,12 @@ class TestStateMachine:
         mgr.get_or_create_text_message(SESSION_ID, persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
 
-        persona.ychat.get_message.reset_mock()
+        persona.chat.get_message.reset_mock()
         mgr.handle_progress(
             SESSION_ID, make_tool_call_progress("tc-1", status="completed"), persona
         )
 
-        persona.ychat.get_message.assert_called_with("msg-group1")
+        persona.chat.get_message.assert_called_with("msg-group1")
 
 
 class TestCancelPendingToolCalls:
@@ -650,12 +650,12 @@ class TestCancelPendingToolCalls:
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
-        persona.ychat.update_message.reset_mock()
+        persona.chat.update_message.reset_mock()
 
         mgr.cancel_pending_tool_calls(SESSION_ID, persona)
 
         # One flush per failed tool call (both share same message)
-        assert persona.ychat.update_message.call_count == 2
+        assert persona.chat.update_message.call_count == 2
 
     def test_noop_for_unknown_session(self):
         mgr = ToolCallManager()
@@ -687,7 +687,7 @@ class TestFullFlow:
             mgr.handle_start(SESSION_ID, make_tool_call_start(f"tc-{i}", f"Task {i}"), persona)
             mgr.handle_progress(SESSION_ID, make_tool_call_progress(f"tc-{i}", status="completed"), persona)
 
-        assert persona.ychat.add_message.call_count == 1
+        assert persona.chat.add_message.call_count == 1
         assert len(mgr.get_all_message_ids(SESSION_ID)) == 1
         # All tool calls map to the same message
         session = mgr._sessions[SESSION_ID]
@@ -701,10 +701,10 @@ class TestFullFlow:
         mgr.reset(SESSION_ID)
 
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-1"), persona)
-        assert persona.ychat.add_message.call_count == 1
-        assert persona.ychat.update_message.call_count == 1
+        assert persona.chat.add_message.call_count == 1
+        assert persona.chat.update_message.call_count == 1
 
         # Consecutive tool call reuses message (grouping)
         mgr.handle_start(SESSION_ID, make_tool_call_start("tc-2"), persona)
-        assert persona.ychat.add_message.call_count == 1  # no new message
-        assert persona.ychat.update_message.call_count == 2  # still flushes
+        assert persona.chat.add_message.call_count == 1  # no new message
+        assert persona.chat.update_message.call_count == 2  # still flushes
