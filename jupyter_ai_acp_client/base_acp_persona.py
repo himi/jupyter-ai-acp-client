@@ -437,12 +437,11 @@ class BaseAcpPersona(BasePersona):
             def _do_terminate():
                 """Ensure Goose subprocess and bridge thread are cleaned up."""
                 stop_event.set()
+                # Kill first. Do NOT close popen.stdout here: the bridge thread may be
+                # blocked in readline() holding the BufferedReader lock, and close()
+                # would deadlock until the child exits.
                 try:
-                    popen.stdout.close()
-                except Exception:
-                    pass
-                try:
-                    if popen.returncode is None:
+                    if popen.poll() is None:
                         popen.kill()
                 except Exception:
                     pass
