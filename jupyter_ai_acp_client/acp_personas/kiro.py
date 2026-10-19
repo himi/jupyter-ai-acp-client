@@ -154,38 +154,18 @@ class KiroAcpPersona(BaseAcpPersona):
         )
     
     async def before_agent_subprocess(self) -> None:
-        # The Kiro ACP agent subprocess fails to start if the user is not signed
-        # in. Therefore we must implement this method to wait until the user is
-        # signed in. The ACP agent server does not start until this is complete.
-        failed_auth_check = False
-        while True:
-            # If authenticated with Kiro, return
-            if await self._check_kiro_auth():
-                break
+        # The kiro-cli ACP subprocess fails to start unless the user is signed
+        # in, so Kiro must gate auth before the subprocess spawns.
+        await self.auth.assert_auth()
 
-            # Reaching here := user is not signed in
-            if not failed_auth_check:
-                self.log.info("[Kiro] User is not signed in.")
-                failed_auth_check = True
-
-            # Re-check every 2 seconds
-            await asyncio.sleep(2)
-        
-        # Reaching this point := user is authenticated
-        self.log.info("[Kiro] User is signed in.")
     
     async def is_authed(self) -> bool:
-        # Trust a settled auth gate, else one-shot check so signed-in users aren't reprompted.
-        fut = self.__class__._before_subprocess_future
-        if fut is not None and fut.done():
-            return True
+        # One-shot auth check. `PersonaAuthManager` caches a True result, so
+        # signed-in users aren't re-checked on every call.
         return await self._check_kiro_auth()
     
-    async def _on_unauthenticated(self) -> None:
-        await self.handle_no_auth(None)
-
-    async def handle_no_auth(self, message: Message | None = None) -> None:
-        await super().handle_no_auth(message)
+    async def handle_message_no_auth(self, message: Message | None = None) -> None:
+        await super().handle_message_no_auth(message)
 
         # Determine which command to show
         use_device_flow = await self._should_use_device_flow()
@@ -199,6 +179,9 @@ class KiroAcpPersona(BaseAcpPersona):
             self._terminal_opened = await self._open_kiro_login_terminal()
             if self._terminal_opened:
                 self.send_message("I've opened a new terminal to help with that.")
+
+        # Poll for sign-in and auto-resume once authenticated.
+        self.auth.start_poll()
 
     async def _check_kiro_auth(self) -> bool:
         """
